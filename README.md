@@ -107,6 +107,12 @@ cp .env.example .env   # (Windows: copy .env.example .env)
 python test_connection.py
 ```
 
+The GPR daily series is not checked in — it's redownloaded automatically by the bot's 16:30 ET job. To prime the cache immediately on a fresh clone:
+
+```bash
+python -c "from signals.regime_filter import download_gpr_daily; download_gpr_daily()"
+```
+
 ### Windows: scheduled tasks
 
 ```powershell

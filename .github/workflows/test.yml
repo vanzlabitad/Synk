@@ -1,0 +1,32 @@
+name: scenario-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  scenario-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Install only the deps scenario_test actually imports at module load
+      # (alpaca, numpy, pandas, requests). The full requirements.txt pulls
+      # torch + transformers which add ~5 minutes to every CI run for a
+      # test that never touches them.
+      - name: Install lean test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install alpaca-py numpy pandas requests
+
+      - name: Run scenario test
+        run: python tests/scenario_test.py
