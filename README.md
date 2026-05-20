@@ -8,7 +8,7 @@
 
 ![Status](https://img.shields.io/badge/status-paper--trading-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![Python](https://img.shields.io/badge/python-3.13%2B-blue)
 
 ---
 
@@ -16,7 +16,7 @@
 
 Three independent signal gates must all pass for entry. Any failure exits the position.
 
-1. **Regime gate** — daily Geopolitical Risk Index (Caldara & Iacoviello) z-score classified into `NORMAL` / `ELEVATED` / `HIGH` / `EXTREME`. Equity longs require `NORMAL` or `ELEVATED`; havens activate on `HIGH`+.
+1. **Regime gate** — daily Geopolitical Risk Index (Caldara & Iacoviello) z-score classified into `NORMAL` / `ELEVATED` / `HIGH` / `EXTREME`. Havens (GLD, FXY) activate from `ELEVATED` (z ≥ 0.5). Defence stocks (LMT, NOC, ITA) require z ≥ 1.0 — a higher bar within the `ELEVATED`+ region to filter structural rearmament-spending noise from acute geopolitical spikes.
 2. **Momentum gate** — 20-day ROC > 0 *and* close > SMA(20). Filters counter-trend entries even when regime and sentiment agree.
 3. **Sentiment gate** — FinBERT over GDELT 2.0 headlines, requiring dominant-class probability > 0.6 *and* |signed score| > 0.3.
 
@@ -61,15 +61,19 @@ All three gates are evaluated hourly. Entries are sized at Quarter-Kelly, capped
 |---|---|---|---|
 | Regime | Caldara–Iacoviello GPR daily | z-score classification by sleeve | `signals/regime_filter.py` |
 | Momentum | Alpaca OHLCV | ROC(20) > 0 ∧ close > SMA(20) | `signals/momentum.py` |
-| Sentiment | GDELT 2.0 headlines → FinBERT | max(prob) > 0.6 ∧ |score| > 0.3 | `signals/sentiment.py` |
+| Sentiment | GDELT 2.0 headlines → FinBERT | max(prob) > 0.6 ∧ abs(score) > 0.3 | `signals/sentiment.py` |
 
 Sentiment is pre-computed in a daily batch (`signals/finbert_drift_monitor.py`) and cached to `logs/sentiment_cache.jsonl` so the hot path doesn't pay FinBERT warm-load cost.
 
 ## Instruments & sizing
 
-- **Equity sleeve:** SPY, QQQ
-- **Haven sleeve:** GLD, FXY, TLT
+- **Haven sleeve (z ≥ 0.5):** GLD (gold), FXY (yen)
+- **Defence sleeve (z ≥ 1.0):** LMT (Lockheed Martin), NOC (Northrop Grumman), ITA (iShares US Aerospace & Defense ETF)
 - **Sizing:** Quarter-Kelly, capped per instrument (see `strategy/synk_strategy.py`)
+- **Per-symbol rules:**
+  - **GLD** — safe-haven hostile-regime exit: blocks entry / forces exit if gold falls during a GPR spike (`signals/regime_filter.py:check_safe_haven_confirmation`)
+  - **FXY** — 52-week-low viability check (`signals/regime_filter.py:check_fxy_viability`)
+  - **Defence** — z-threshold raised to 1.0 from the global 0.5; backtest showed 47% of defence trades at z=0.5–1.0 fired on structural rearmament rather than acute GPR events
 
 ## Risk management
 
@@ -85,7 +89,7 @@ State persists to `logs/kill_switch_state.json` so a process restart can't paper
 
 ## Stack
 
-Python 3.11+, Alpaca paper API, Hugging Face `transformers` (FinBERT), GDELT 2.0, Caldara–Iacoviello GPR daily series, APScheduler, Lumibot (backtesting only).
+Python 3.13+, Alpaca paper API, Hugging Face `transformers` (FinBERT), GDELT 2.0, Caldara–Iacoviello GPR daily series, APScheduler, Lumibot (backtesting only).
 
 ## Setup
 
