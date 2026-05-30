@@ -14,6 +14,8 @@ Jobs (all UTC unless noted):
     Hourly at :10:   check_exits() — stop loss + momentum flip exit check
     Daily  08:00:    run_batch_check() — FinBERT drift monitor, append to health.jsonl
     Daily  16:30 ET: download_gpr_daily() — skip if < 24h old
+    Daily  15:00:    rebalance_sleeve() — defence-beta sleeve (no-op unless enabled;
+                     self-gates on quarterly cadence + drift band + market-open)
 
 Watchdog is a SEPARATE Task Scheduler process (alerts/watchdog.py), not a
 thread here. This process writes heartbeat.json so watchdog detects hangs.
@@ -203,9 +205,11 @@ def job_strategy() -> None:
         # Alpaca positions that we expected to be open but are now gone have
         # been closed by their bracket child orders (stop or TP filled).
         try:
+            # Exclude the defence-beta sleeve — it is held outside gated logic and
+            # must never enter expected_positions.json (else check_exits would sell it).
             current_positions: set[str] = {
                 p.symbol for p in client.get_all_positions()
-            }
+            } - {cfg.SLEEVE_SYMBOL}
         except Exception as exc:
             log.warning("Could not fetch positions — skipping exit detection: %s", exc)
             current_positions = set()
@@ -275,6 +279,23 @@ def job_check_exits() -> None:
         check_exits(cfg)
     except Exception as exc:
         log.error("check_exits job failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Defence-beta sleeve rebalance
+# ---------------------------------------------------------------------------
+def job_sleeve_rebalance() -> None:
+    """
+    Maintain the defence-beta sleeve at target weight (quarterly + drift band).
+    Runs daily; cadence/band/market-open guards live inside rebalance_sleeve().
+    No-op when SLEEVE_ENABLED is false. Independent of the kill switch.
+    """
+    from execution.sleeve_executor import rebalance_sleeve  # noqa: PLC0415
+    from config import get_config  # noqa: PLC0415
+    try:
+        rebalance_sleeve(get_config())
+    except Exception as exc:
+        log.error("Sleeve rebalance job failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -422,12 +443,24 @@ def main() -> None:
         misfire_grace_time=3600,
     )
 
+    # Defence-beta sleeve — daily check at 15:00 UTC (mid US morning); the
+    # function self-gates on quarterly cadence + drift band + market-open, so a
+    # daily trigger is robust to weekends/holidays. No-op if SLEEVE_ENABLED=false.
+    scheduler.add_job(
+        job_sleeve_rebalance,
+        CronTrigger(hour=15, minute=0),
+        id="sleeve_rebalance",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+
     job_ids = [j.id for j in scheduler.get_jobs()]
     log.info("Scheduler armed | jobs: %s", job_ids)
     log.info(
         "Schedule: heartbeat=5min | kill_switch=15min | "
         "sentiment/prices=:00 | health=:05 | strategy/exits=:10 | "
-        "finbert_drift=08:00 UTC | gpr=16:30 ET"
+        "finbert_drift=08:00 UTC | gpr=16:30 ET | sleeve=15:00 UTC"
     )
 
     send_telegram(

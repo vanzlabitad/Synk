@@ -7,8 +7,13 @@ is acted on.
 
 Three triggers (hard limits, not soft warnings):
     1. Per-trade stop-loss:  2% of portfolio NAV on any single position
-    2. Daily loss limit:     5% of NAV (equity vs last_equity from Alpaca)
+    2. Daily loss limit:     5% of NAV (gated equity vs start-of-day snapshot)
     3. Peak drawdown limit: 30% from high-water mark (tracked in state file)
+
+Risk basis = GATED EQUITY = total account equity - defence-sleeve market value
+(config.SLEEVE_SYMBOL). The sleeve is a separate buy-and-hold tilt held outside
+gated logic; its drawdown must not trip the gated strategy's kill switch.
+Thresholds are unchanged (2/5/30) — only the equity basis excludes the sleeve.
 
 State persistence:
     logs/kill_switch_state.json — atomic write via os.replace(), never partial.
@@ -106,7 +111,10 @@ class KillStatus:
 # ---------------------------------------------------------------------------
 _DEFAULT_STATE: dict = {
     "state": "ACTIVE",
-    "peak_equity": None,    # populated on first check
+    "peak_equity": None,            # gated-equity high-water mark (populated on first check)
+    "peak_gated_equity": None,      # same value; explicit name
+    "day_open_gated_equity": None,  # gated equity snapshot at start of UTC day
+    "day_open_date": None,          # UTC date of the snapshot
     "halted_at": None,
     "halt_reason": None,
     "last_checked_utc": None,
@@ -175,25 +183,56 @@ def check_triggers(config=None) -> KillStatus:
     client = TradingClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY, paper=config.PAPER)
     acct = client.get_account()
 
-    equity = float(acct.equity)
-    last_equity = float(acct.last_equity)
+    total_equity = float(acct.equity)
     now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    # --- Sleeve carve-out: exclude the defence-beta sleeve from the risk basis ---
+    # The sleeve is a separate buy-and-hold tilt held outside gated logic; its
+    # drawdown must not trip the gated strategy's kill switch. We track "gated
+    # equity" = total account equity - sleeve market value.
+    sleeve_symbol = getattr(config, "SLEEVE_SYMBOL", "PPA")
+    sleeve_value = 0.0
+    try:
+        for p in client.get_all_positions():
+            if p.symbol == sleeve_symbol:
+                sleeve_value = float(p.market_value)
+                break
+    except Exception as exc:
+        log.warning("Kill switch: could not fetch positions for sleeve carve-out (%s) — using total equity", exc)
+
+    gated_equity = total_equity - sleeve_value
 
     # Load persisted state
     state = _load_state()
 
-    # Initialise peak_equity on first run
-    peak_equity = float(state["peak_equity"]) if state["peak_equity"] is not None else equity
-    if equity > peak_equity:
-        peak_equity = equity
+    # Peak tracked on GATED equity (new high-water mark)
+    peak_gated = state.get("peak_gated_equity")
+    peak_gated = float(peak_gated) if peak_gated is not None else gated_equity
+    if gated_equity > peak_gated:
+        peak_gated = gated_equity
 
-    # Compute metrics
-    daily_pnl_pct = (equity - last_equity) / last_equity if last_equity else 0.0
-    drawdown_pct = (peak_equity - equity) / peak_equity if peak_equity else 0.0
+    # Daily-loss basis: snapshot of gated equity at the first check of each UTC day
+    day_open_date = state.get("day_open_date")
+    day_open_gated = state.get("day_open_gated_equity")
+    if day_open_date != today or day_open_gated is None:
+        day_open_date = today
+        day_open_gated = gated_equity
+    day_open_gated = float(day_open_gated)
+
+    # Compute metrics on the GATED basis (thresholds unchanged: 2/5/30)
+    daily_pnl_pct = (gated_equity - day_open_gated) / day_open_gated if day_open_gated else 0.0
+    drawdown_pct = (peak_gated - gated_equity) / peak_gated if peak_gated else 0.0
+
+    # Names kept for the rest of the function / KillStatus (gated basis drives triggers)
+    equity = gated_equity
+    peak_equity = peak_gated
 
     log.info(
-        "Kill switch check | equity=%.2f | peak=%.2f | daily_pnl=%.2f%% | drawdown=%.2f%%",
-        equity, peak_equity, daily_pnl_pct * 100, drawdown_pct * 100,
+        "Kill switch check | total=%.2f sleeve(%s)=%.2f gated=%.2f | "
+        "peak_gated=%.2f | daily_pnl=%.2f%% | drawdown=%.2f%%",
+        total_equity, sleeve_symbol, sleeve_value, gated_equity,
+        peak_gated, daily_pnl_pct * 100, drawdown_pct * 100,
     )
 
     # Evaluate triggers (checked in severity order)
@@ -217,7 +256,10 @@ def check_triggers(config=None) -> KillStatus:
         log.critical("KILL SWITCH TRIGGERED: %s", halt_reason)
         new_state = {
             "state": "HALTED",
-            "peak_equity": peak_equity,
+            "peak_equity": peak_equity,           # gated-equity high-water mark
+            "peak_gated_equity": peak_gated,
+            "day_open_gated_equity": day_open_gated,
+            "day_open_date": day_open_date,
             "halted_at": now_utc,
             "halt_reason": halt_reason,
             "last_checked_utc": now_utc,
@@ -233,8 +275,11 @@ def check_triggers(config=None) -> KillStatus:
             drawdown_pct=drawdown_pct,
         )
 
-    # No trigger — update peak and timestamp
-    state["peak_equity"] = peak_equity
+    # No trigger — update peak / daily snapshot / timestamp
+    state["peak_equity"] = peak_equity            # gated-equity high-water mark
+    state["peak_gated_equity"] = peak_gated
+    state["day_open_gated_equity"] = day_open_gated
+    state["day_open_date"] = day_open_date
     state["last_checked_utc"] = now_utc
     _save_state(state)
 
@@ -268,11 +313,11 @@ def reset_to_active(reason: str = "Manual reset") -> None:
 if __name__ == "__main__":
     status = check_triggers()
 
-    print("\n--- Kill Switch Status ---")
-    print(f"Triggered:    {status.triggered}")
-    print(f"Equity:       ${status.equity:,.2f}")
-    print(f"Peak equity:  ${status.peak_equity:,.2f}")
-    print(f"Daily P&L:    {status.daily_pnl_pct*100:+.3f}% (limit: -{_DAILY_LOSS_PCT*100:.0f}%)")
-    print(f"Drawdown:     {status.drawdown_pct*100:.3f}% (limit: {_PEAK_DRAWDOWN_PCT*100:.0f}%)")
+    print("\n--- Kill Switch Status (gated-equity basis; sleeve excluded) ---")
+    print(f"Triggered:        {status.triggered}")
+    print(f"Gated equity:     ${status.equity:,.2f}")
+    print(f"Peak gated:       ${status.peak_equity:,.2f}")
+    print(f"Daily P&L:        {status.daily_pnl_pct*100:+.3f}% (limit: -{_DAILY_LOSS_PCT*100:.0f}%)")
+    print(f"Drawdown:         {status.drawdown_pct*100:.3f}% (limit: {_PEAK_DRAWDOWN_PCT*100:.0f}%)")
     if status.reason:
         print(f"Halt reason:  {status.reason}")

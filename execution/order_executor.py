@@ -525,8 +525,12 @@ def check_exits(cfg: object) -> None:
             log.error("check_exits: could not fetch Alpaca positions: %s", exc)
             return
 
-        # Only act on symbols that are both expected AND currently open in Alpaca
-        open_symbols = expected & set(alpaca_positions.keys())
+        # Only act on symbols that are both expected AND currently open in Alpaca.
+        # Exclude the defence-beta sleeve — it is held outside gated logic and must
+        # never be momentum/stop-exited by this loop (belt-and-braces: it should
+        # not be in `expected` either, since job_strategy carves it out).
+        sleeve_symbol = getattr(cfg, "SLEEVE_SYMBOL", "PPA")
+        open_symbols = (expected & set(alpaca_positions.keys())) - {sleeve_symbol}
         if not open_symbols:
             log.debug("check_exits: expected positions not found in Alpaca — skipping")
             return
