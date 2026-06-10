@@ -9,11 +9,19 @@ if (-not $pythonW) {
     exit 1
 }
 
-# --- SynkBot: runs at logon, loops forever (restart loop is inside the .bat) ---
+# --- SynkBot: runs at logon + boot, loops forever (restart loop is inside the .bat) ---
+# Battery flags are load-bearing: without them Task Scheduler hard-kills the whole
+# process tree the moment the laptop comes off AC power, and the at-logon-only
+# trigger means it stays dead until the next login.
 $botAction   = New-ScheduledTaskAction -Execute "$synkDir\run_bot.bat" -WorkingDirectory $synkDir
-$botTrigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$botSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName "SynkBot" -Action $botAction -Trigger $botTrigger `
+$botTriggers = @(
+    (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME),
+    (New-ScheduledTaskTrigger -AtStartup)
+)
+$botSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName "SynkBot" -Action $botAction -Trigger $botTriggers `
     -Settings $botSettings -RunLevel Highest -Force
 Write-Host "SynkBot task registered."
 
@@ -21,7 +29,8 @@ Write-Host "SynkBot task registered."
 $wdAction   = New-ScheduledTaskAction -Execute $pythonW `
     -Argument "alerts\watchdog.py" -WorkingDirectory $synkDir
 $wdTrigger  = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Minutes 15) -Once -At (Get-Date)
-$wdSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+$wdSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName "SynkWatchdog" -Action $wdAction -Trigger $wdTrigger `
     -Settings $wdSettings -RunLevel Highest -Force
 Write-Host "SynkWatchdog task registered."
@@ -30,7 +39,8 @@ Write-Host "SynkWatchdog task registered."
 $reviewAction   = New-ScheduledTaskAction -Execute $pythonW `
     -Argument "weekly_review.py" -WorkingDirectory $synkDir
 $reviewTrigger  = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At "19:00"
-$reviewSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+$reviewSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName "SynkWeeklyReview" -Action $reviewAction `
     -Trigger $reviewTrigger -Settings $reviewSettings -RunLevel Highest -Force
 Write-Host "SynkWeeklyReview task registered."

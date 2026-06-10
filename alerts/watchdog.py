@@ -7,7 +7,9 @@ main.py. If main.py hangs or crashes, this process still runs.
 
 Checks on each execution:
     1. Heartbeat freshness: reads logs/heartbeat.json.
-       If last_alive > 10 min ago → Telegram alert "SYNK HEARTBEAT LOST".
+       If last_alive > 10 min ago → restart the bot (Windows: end + re-run the
+       SynkBot scheduled task; other OSes: left to systemd Restart=always),
+       then Telegram alert "HEARTBEAT LOST" at most once per 60 min.
     2. Kill switch state: reads logs/kill_switch_state.json.
        If state=HALTED and last re-alert was > 60 min ago → re-alert "SYNK STILL HALTED".
 
@@ -36,6 +38,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -63,7 +67,9 @@ load_dotenv()
 # Tuneable thresholds
 # ---------------------------------------------------------------------------
 _HEARTBEAT_MAX_AGE_SECONDS = 10 * 60   # alert if heartbeat > 10 min old
+_HEARTBEAT_REALERT_INTERVAL = 60 * 60  # re-alert on stale heartbeat every 60 min
 _REHALT_ALERT_INTERVAL = 60 * 60       # re-alert on HALTED state every 60 min
+_BOT_TASK_NAME = "SynkBot"             # Windows Task Scheduler task to restart
 
 # ---------------------------------------------------------------------------
 # Logging — watchdog.log is separate so it survives main.py crashes
@@ -121,10 +127,51 @@ def _seconds_since(iso_timestamp: str | None) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Bot restart
+# ---------------------------------------------------------------------------
+def _attempt_bot_restart() -> str:
+    """
+    Try to restart the bot via the OS scheduler. Returns a short status string
+    for the Telegram alert.
+
+    Windows: end the SynkBot task first (kills a hung python — a stale heartbeat
+    with a still-"Running" task means a hang, and /run alone would be ignored
+    under MultipleInstancesPolicy=IgnoreNew), then start it fresh.
+    Other OSes: systemd owns restarts (Restart=always) — never intervene.
+    """
+    if platform.system() != "Windows":
+        return "restart left to systemd"
+
+    try:
+        # /end fails harmlessly if the task is not running — ignore its rc.
+        subprocess.run(
+            ["schtasks", "/end", "/tn", _BOT_TASK_NAME],
+            capture_output=True, text=True, timeout=30,
+        )
+        result = subprocess.run(
+            ["schtasks", "/run", "/tn", _BOT_TASK_NAME],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.error("Bot restart failed: %s", exc)
+        return f"restart FAILED ({exc})"
+
+    if result.returncode == 0:
+        log.info("Bot restart attempted: schtasks /run %s succeeded", _BOT_TASK_NAME)
+        return f"restart attempted via {_BOT_TASK_NAME} task"
+
+    log.error(
+        "Bot restart failed: schtasks exit %d | %s",
+        result.returncode, (result.stderr or result.stdout).strip(),
+    )
+    return f"restart FAILED (schtasks exit {result.returncode})"
+
+
+# ---------------------------------------------------------------------------
 # Individual checks
 # ---------------------------------------------------------------------------
 def _check_heartbeat(wd_state: dict) -> None:
-    """Alert if main.py heartbeat is older than _HEARTBEAT_MAX_AGE_SECONDS."""
+    """Restart the bot and alert if heartbeat is older than _HEARTBEAT_MAX_AGE_SECONDS."""
     if not _HEARTBEAT_PATH.exists():
         log.warning("Heartbeat file missing — main.py may not have started yet")
         return
@@ -142,13 +189,25 @@ def _check_heartbeat(wd_state: dict) -> None:
     if age <= _HEARTBEAT_MAX_AGE_SECONDS:
         return
 
-    # Stale heartbeat — alert (always, not deduplicated, since this is urgent)
+    # Stale heartbeat — restart first (every cycle; it's idempotent), then alert
+    # at most once per _HEARTBEAT_REALERT_INTERVAL so Telegram isn't spammed.
+    restart_status = _attempt_bot_restart()
+
     msg = (
         f"HEARTBEAT LOST — last alive {age/60:.0f} min ago "
         f"(threshold: {_HEARTBEAT_MAX_AGE_SECONDS//60} min). "
-        "main.py may be hung or crashed."
+        f"{restart_status}."
     )
     log.critical(msg)
+
+    since_last_alert = _seconds_since(wd_state.get("last_heartbeat_alert_utc"))
+    if since_last_alert < _HEARTBEAT_REALERT_INTERVAL:
+        log.info(
+            "Re-alert suppressed — last sent %.0f min ago (interval: %d min)",
+            since_last_alert / 60, _HEARTBEAT_REALERT_INTERVAL // 60,
+        )
+        return
+
     send_telegram(msg)
     wd_state["last_heartbeat_alert_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
