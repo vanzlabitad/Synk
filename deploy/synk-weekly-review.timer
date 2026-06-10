@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Synk Weekly Review every Sunday 19:00 UK time
+
+[Timer]
+OnCalendar=Sun 19:00 Europe/London
+Persistent=true
+Unit=synk-weekly-review.service
+
+[Install]
+WantedBy=timers.target

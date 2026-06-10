@@ -1,0 +1,12 @@
+[Unit]
+Description=Synk Weekly Review (single run)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/synk
+EnvironmentFile=/root/synk/.env
+ExecStart=/root/synk/.venv/bin/python weekly_review.py
+StandardOutput=append:/root/synk/logs/weekly_review.log
+StandardError=append:/root/synk/logs/weekly_review.log

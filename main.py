@@ -16,6 +16,7 @@ Jobs (all UTC unless noted):
     Daily  16:30 ET: download_gpr_daily() — skip if < 24h old
     Daily  15:00:    rebalance_sleeve() — defence-beta sleeve (no-op unless enabled;
                      self-gates on quarterly cadence + drift band + market-open)
+    Daily  21:00:    job_daily_summary() — one Telegram with the day's activity
 
 Watchdog is a SEPARATE Task Scheduler process (alerts/watchdog.py), not a
 thread here. This process writes heartbeat.json so watchdog detects hangs.
@@ -235,6 +236,24 @@ def job_strategy() -> None:
             len(open_gates), len(results) - len(open_gates),
         )
 
+        # Per-gate blocker breakdown — makes zero-trade periods attributable
+        # (which gate is doing the blocking) without per-symbol log spam.
+        closed_results = [r for r in results if not r.all_open]
+        if closed_results:
+            blocker_tags = {
+                "regime": "REGIME=CLOSED",
+                "momentum": "MOMENTUM=CLOSED",
+                "sentiment": "SENTIMENT=CLOSED",
+                "safe_haven": "SH_HOSTILE_REGIME",
+                "fxy_52w": "FXY_52W_LOW_GATE",
+            }
+            counts = {
+                name: sum(1 for r in closed_results if tag in r.reason)
+                for name, tag in blocker_tags.items()
+            }
+            breakdown = " ".join(f"{k}={v}" for k, v in counts.items() if v)
+            log.info("Gate blockers | %s", breakdown or "unparsed reason")
+
         if not open_gates:
             log.info("No gates open — no orders submitted")
             return
@@ -296,6 +315,77 @@ def job_sleeve_rebalance() -> None:
         rebalance_sleeve(get_config())
     except Exception as exc:
         log.error("Sleeve rebalance job failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Daily summary
+# ---------------------------------------------------------------------------
+def job_daily_summary() -> None:
+    """
+    Send one Telegram per day (21:00 UTC) summarising the day's activity.
+    The absence of this message is itself an alarm signal — it means the bot
+    was down at send time — so each section degrades to 'n/a' rather than
+    letting one failure suppress the whole message.
+    """
+    from config import get_config  # noqa: PLC0415
+    from alpaca.trading.client import TradingClient  # noqa: PLC0415
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # --- Activity counts from today's process.log lines ---
+    starts = cycles = trades = 0
+    last_gate_summary = "n/a"
+    try:
+        with open(_LOG_DIR / "process.log", encoding="utf-8") as f:
+            for line in f:
+                if not line.startswith(today):
+                    continue
+                if "Synk bot starting" in line:
+                    starts += 1
+                elif "Strategy cycle start" in line:
+                    cycles += 1
+                elif "TRADE INSTRUCTION" in line:
+                    trades += 1
+                elif "Gate summary" in line:
+                    last_gate_summary = line.split("| INFO | ")[-1].strip()
+    except OSError as exc:
+        log.error("Daily summary: cannot read process.log: %s", exc)
+
+    # --- Account snapshot (same client pattern as job_strategy) ---
+    equity_txt = sleeve_txt = "n/a"
+    try:
+        cfg = get_config()
+        client = TradingClient(cfg.ALPACA_API_KEY, cfg.ALPACA_SECRET_KEY, paper=cfg.PAPER)
+        equity = float(client.get_account().equity)
+        sleeve_value = sum(
+            float(p.market_value)
+            for p in client.get_all_positions()
+            if p.symbol == cfg.SLEEVE_SYMBOL
+        )
+        equity_txt = f"${equity:,.2f}"
+        sleeve_txt = f"${sleeve_value:,.2f} ({sleeve_value / equity:.1%})" if equity else "n/a"
+    except Exception as exc:
+        log.error("Daily summary: account snapshot failed: %s", exc)
+
+    # --- Kill switch state ---
+    ks_state = "UNKNOWN"
+    try:
+        ks = json.loads((_LOG_DIR / "kill_switch_state.json").read_text(encoding="utf-8"))
+        ks_state = ks.get("state", "UNKNOWN")
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    send_telegram(
+        f"\U0001F4CA *Synk daily summary* ({today})\n"
+        f"Equity: {equity_txt} | Sleeve: {sleeve_txt}\n"
+        f"Kill switch: {ks_state}\n"
+        f"Strategy cycles: {cycles} | Trade instructions: {trades} | Restarts: {starts}\n"
+        f"Last gates: {last_gate_summary}"
+    )
+    log.info(
+        "Daily summary sent | cycles=%d trades=%d restarts=%d ks=%s",
+        cycles, trades, starts, ks_state,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +545,23 @@ def main() -> None:
         misfire_grace_time=3600,
     )
 
+    # Daily summary — 21:00 UTC (22:00 UK summer); silence = bot is down
+    scheduler.add_job(
+        job_daily_summary,
+        CronTrigger(hour=21, minute=0),
+        id="daily_summary",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+
     job_ids = [j.id for j in scheduler.get_jobs()]
     log.info("Scheduler armed | jobs: %s", job_ids)
     log.info(
         "Schedule: heartbeat=5min | kill_switch=15min | "
         "sentiment/prices=:00 | health=:05 | strategy/exits=:10 | "
-        "finbert_drift=08:00 UTC | gpr=16:30 ET | sleeve=15:00 UTC"
+        "finbert_drift=08:00 UTC | gpr=16:30 ET | sleeve=15:00 UTC | "
+        "daily_summary=21:00 UTC"
     )
 
     send_telegram(
