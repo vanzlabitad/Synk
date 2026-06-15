@@ -31,11 +31,20 @@ mkdir -p logs
 
 echo ""
 echo "=== [6/8] Create .env ==="
-echo "    Open nano. Paste your credentials. Save with Ctrl+O → Enter → Ctrl+X."
+echo "    Open nano. Paste your credentials (incl. HF_TOKEN for FinBERT)."
+echo "    Save with Ctrl+O → Enter → Ctrl+X."
 echo "    Press Enter to open nano..."
 read -r _
 nano .env
 chmod 600 .env
+
+# Non-fatal: the bot still runs without a token, but the first FinBERT
+# download will be unauthenticated and HF-rate-limit prone on cold start.
+if ! grep -qE '^HF_TOKEN=.+' .env; then
+  echo "    WARNING: HF_TOKEN is missing or empty in .env — FinBERT will"
+  echo "             download unauthenticated (slower, rate-limit prone)."
+  echo "             Add a READ token from https://huggingface.co/settings/tokens"
+fi
 
 echo "=== [7/8] Basic hardening (firewall + auto security updates) ==="
 apt-get install -y ufw unattended-upgrades
