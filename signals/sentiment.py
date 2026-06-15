@@ -147,8 +147,21 @@ def _get_pipeline():
             sys.stdout = open(os.devnull, "w")
         if sys.stderr is None:
             sys.stderr = open(os.devnull, "w")
+        # Load .env so HF_TOKEN is available even on standalone runs (idempotent;
+        # won't clobber env vars already set by the main entrypoint).
+        from dotenv import load_dotenv  # noqa: PLC0415
+        load_dotenv()
+        # Silence the transformers weight-load report (the harmless
+        # "bert.embeddings.position_ids | UNEXPECTED" table) — keep ERROR so
+        # genuine load failures still surface.
+        from transformers.utils import logging as hf_logging  # noqa: PLC0415
+        hf_logging.set_verbosity_error()
         from transformers import pipeline as hf_pipeline  # noqa: PLC0415
-        log.info("Loading FinBERT model: %s (first call, ~25s on CPU)", _MODEL_NAME)
+        # token=None is the anonymous default; a real HF_TOKEN authenticates the
+        # download/metadata check, avoiding HF rate-limit warnings on cold start.
+        hf_token = os.environ.get("HF_TOKEN") or None
+        log.info("Loading FinBERT model: %s (auth=%s, first call, ~25s on CPU)",
+                 _MODEL_NAME, "yes" if hf_token else "no")
         t0 = time.time()
         _pipeline = hf_pipeline(
             "text-classification",
@@ -156,6 +169,7 @@ def _get_pipeline():
             top_k=None,
             truncation=True,
             max_length=_MAX_TOKEN_LENGTH,
+            token=hf_token,
         )
         log.info("FinBERT loaded in %.1fs", time.time() - t0)
     return _pipeline
